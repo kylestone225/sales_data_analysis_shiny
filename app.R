@@ -1,6 +1,10 @@
 r = getOption("repos")
 r["CRAN"] = "http://cran.us.r-project.org"
 options(repos = r)
+install.packages("tidyverse")
+install.packages("tigris")
+install.packages("shiny")
+install.packages("plotly")
 library(tigris)
 library(tidyverse)
 library(mapdata)
@@ -9,27 +13,15 @@ library(sf)
 library(shiny)
 library(plotly)
 library(scales)
+library(viridis)
 
 Sys.setlocale("LC_ALL", "C")
 
-usa <- st_as_sf(maps::map("state", fill = TRUE, plot = FALSE))
-
-usa <- usa |>
-  rename(State = ID)
-
-usa$State <- str_to_title(usa$State)
-
-
 store_data <- as.data.frame(read.csv("superstore_final_dataset (1).csv"))
-
-uszips <- zctas(cb = TRUE, year = 2020)
-
-store_data$Postal_Code <- as.character(store_data$Postal_Code)
 
 store_by_state <- store_data |>
   group_by(State) |>
   summarize(total_state_sales = sum(Sales))
-
 
 store_by_zip <- store_data |>
   group_by(Postal_Code) |>
@@ -47,9 +39,6 @@ store_data_subcat <- store_data |>
 store_data_region <- store_data |>
   group_by(Region) |>
   summarise(region_sales = sum(Sales))
-
-uszips <- uszips |>
-  rename(zip_geometry = geometry)
 
 store_data$Order_Date <- format(as.Date(store_data$Order_Date, format = '%d/%m/%Y'),'%Y-%m-%d')
 
@@ -80,11 +69,44 @@ store_data <- left_join(store_data, store_data_order_date, by = "Order_Date")
 store_data <- left_join(store_data, reg_cat_sales, by = c("Region", "Category"))
 store_data <- left_join(store_data, reg_subcat_sales, by = c("Region", "Category", "Sub_Category"))
 store_data <- left_join(store_data, od_cat, by = c("Order_Date", "Category"))
-store_data <- left_join(store_data, usa, by = "State")
+
+us_states <- states(cb = TRUE, resolution = "20m")
+
+us_states_shifted <- shift_geometry(us_states) %>%
+  mutate(lon = st_coordinates(st_centroid(.))[,1],
+         lat = st_coordinates(st_centroid(.))[,2],
+         lat = case_when(NAME == "Mississippi" ~ lat -0.5e5,
+                         NAME == "Alabama" ~ lat + 0.5e5,
+                         NAME == "Illinois" ~ lat -0.5e5,
+                         NAME == "Indiana" ~ lat + 0.5e5,
+                         .default = lat)) |>
+  rename(State = NAME)
+
+move_labels <- c("Connecticut", "Delaware",
+                 "Maryland", "Massachusetts", "New Hampshire", "New Jersey",
+                 "Rhode Island", "Vermont")
+
+move_states <- us_states_shifted %>%
+  filter(State %in% move_labels) %>%
+  arrange(lat) %>%
+  mutate(xend = 2.2e6,
+         yend = seq(min(lat)-2.5e5, max(lat), length.out = n()))
+
+store_data <- left_join(store_data, us_states_shifted, by = "State")
+
+
+uszips <- zctas(cb = TRUE, year = 2020)
+
+uszips <- uszips |>
+  rename(zip_geometry = geometry)
+
+store_data$Postal_Code <- as.character(store_data$Postal_Code)
+
 store_data <- left_join(store_data, uszips, by = c("Postal_Code" = "ZCTA5CE20"))
 
+
 sd_plotting <- as.data.frame(store_data)
-sd_plotting$geom <- NULL
+sd_plotting$geometry <- NULL
 sd_plotting$zip_geometry <- NULL
 
 
@@ -143,8 +165,21 @@ ui <- fluidPage(
                       selectInput("streg", "Select Map View", c("State", "Region", "Zip Code"), selected = "State")
                )
              ),
-             actionButton("natfetch", tags$strong("Fetch Data"), class = "btn-sm btn-success"),
-             plotOutput("natplot"),
+             fluidRow(
+               column(6,
+                      actionButton("natfetch", tags$strong("Fetch Data"), class = "btn-sm btn-success")
+               ),
+               column(6,
+                      conditionalPanel(
+                        "input.streg === 'Zip Code'",
+                        style = "display: none;",
+                        tags$h4("Set Coordinates To Zoom"),
+                        tags$hr(),
+                        sliderInput("lon", "Select Longitude",value = c(-123, -73), min = -123, max = -73),
+                        sliderInput("lat", "Select Latitude", value = c(25, 50), min = 25, max = 50))
+               )
+             ),
+             plotOutput("natplot", width = "1400px", height = "600px"),
              fluidRow(
                column(12,
                       plotlyOutput("natcol")
@@ -276,14 +311,34 @@ server <- function(input, output, session){
   output$natplot <- renderPlot({
     if(streg() == "State"){
       nat_sub_cat() |>
-        group_by(State, geom) |>
+        group_by(State, geometry) |>
         summarize(tot_st_sales = sum(Sales)) |>
         ggplot() +
-        geom_sf(aes(fill = tot_st_sales, color = "grey", geometry = geom), show.legend = FALSE) +
-        geom_sf_text(aes(label = dollar(tot_st_sales), geometry = geom, size = 4),
-                     show.legend = FALSE) +
-        labs(title = "Total Sales By State Based On Your Selection") +
+        geom_sf(aes(fill = tot_st_sales, color = "grey", geometry = geometry), show.legend = FALSE) +
         scale_fill_distiller("tot_st_sales", palette="Spectral") +
+        geom_label(data = nat_sub_cat() |>
+                     group_by(State, geometry, lon, lat) |>
+                     summarize(tot_st_sales = sum(Sales)) |>
+                     filter(!State %in% move_labels),
+                   aes(x = lon, y = lat,
+                       label = dollar(tot_st_sales)),
+                   fill = "white",
+                   size = 4) +
+        geom_label(data = nat_sub_cat() |>
+                     group_by(State, geometry) |>
+                     summarize(tot_st_sales = sum(Sales)) |>
+                     merge(move_states, by = c("State", "geometry")),
+                   aes(x = xend, y = yend,
+                       label = dollar(tot_st_sales)),
+                   fill = "white",
+                   size = 4,
+                   hjust = 0) +
+        geom_segment(data = move_states, 
+                     aes(lon, lat, xend = xend, yend = yend),
+                     colour = "grey60",
+                     linewidth = 0.3) +
+        coord_sf(clip = "off") +
+        labs(title = "Total Sales By State Based On Your Selection") +
         scale_color_identity(guide = "legend") +
         scale_size_identity(guide = "legend") +
         theme_classic()
@@ -291,8 +346,8 @@ server <- function(input, output, session){
       if(streg() == "Region"){
         nat_sub_cat() |>
           ggplot() +
-          geom_sf(aes(fill = region_sales, color = "grey", geometry = geom)) +
-          labs(title = "Total Sales By Region (unfiltered)") +
+          geom_sf(aes(fill = region_sales, geometry = geometry)) +
+          labs(title = "Total Sales By Region") +
           scale_fill_distiller("region_sales", palette="Spectral", label = label_comma()) +
           scale_color_identity(guide = "legend") +
           theme_classic()
@@ -302,10 +357,11 @@ server <- function(input, output, session){
             group_by(Postal_Code, zip_geometry) |>
             summarize(tot_z_sales = sum(Sales)) |>
             ggplot() +
-            geom_sf(aes(fill = tot_z_sales, geometry = zip_geometry), show.legend = FALSE) +
+            geom_sf(aes(fill = tot_z_sales, geometry = zip_geometry)) +
             labs(title = "Zip Codes Containing Sales of Your Selections") +
-            scale_color_identity(guide = "legend") +
-            theme_minimal()
+            scale_fill_distiller("Sales By Zip", palette="Spectral", label = label_comma()) +
+            coord_sf(xlim = c(input$lon[1], input$lon[2]), ylim = c(input$lat[1], input$lat[2])) +
+            theme_classic()
         }
       }
     }
@@ -378,17 +434,17 @@ server <- function(input, output, session){
   # Plot of selected state
   output$stplot <- renderPlot({
     st_sub_final() |>
-      group_by(State, geom) |>
+      group_by(State, geometry) |>
       summarize(tot_st_sales = sum(Sales)) |>
       ggplot() +
-      geom_sf(aes(fill = tot_st_sales, color = "grey", geometry = geom), show.legend = FALSE) +
-      geom_sf_text(aes(label = dollar(tot_st_sales), geometry = geom, size = 4),
+      geom_sf(aes(fill = tot_st_sales, color = "grey", geometry = geometry), show.legend = FALSE) +
+      geom_sf_text(aes(label = dollar(tot_st_sales), geometry = geometry, size = 4),
                    show.legend = FALSE) +
       labs(title = "Total Sales By State Based On Your Selection") +
       scale_fill_distiller("tot_st_sales", palette="Spectral") +
       scale_color_identity(guide = "legend") +
       scale_size_identity(guide = "legend") +
-      theme_classic()
+      theme_void()
   })
   
   #SF geoms are lists and not conducive to the interactive features of shiny. Below an identical
@@ -480,7 +536,7 @@ server <- function(input, output, session){
       labs(title = "Zip Codes Containing Sales of Your Selections") +
       scale_fill_distiller("tot_z_sales", palette="Spectral") +
       scale_color_identity(guide = "legend") +
-      theme_minimal()
+      theme_void()
   }) 
   
   # zip code plotting data without the geom lists
@@ -527,6 +583,5 @@ server <- function(input, output, session){
 }
 
 shinyApp(ui, server)
-
 
 
